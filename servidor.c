@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <netinet/ip.h>
 #include <fcntl.h>
+#include <getopt.h>  // Inclusão para processar argumentos de linha de comando
 
 #define TAMANHO_BUFFER 4096
 #define TAMANHO_DADOS 512
@@ -16,7 +17,7 @@
 #define FLAG_NACK 0x2
 #define FLAG_SYN 0x4
 #define FLAG_FIN 0x8
-#define FLAG_ERR 0x10  // For error simulation
+#define FLAG_ERR 0x10  // Para simulação de erro
 
 // Estrutura do nosso "UDP" simulado com novos campos
 struct udp_simulado {
@@ -50,7 +51,7 @@ void set_nonblocking(int sock) {
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     struct sockaddr_in cliente;
     int sock;
     char buffer[TAMANHO_BUFFER];
@@ -59,10 +60,41 @@ int main() {
     socklen_t tamanho_cliente;
     int bytes_recebidos;
     uint32_t expected_seq = 0;
-    int ack_loss_packet;
-    int nack_packet;
-    int error_ack_packet;
+    int ack_loss_packet = -1;
+    int nack_packet = -1;
+    int error_ack_packet = -1;
     uint16_t recv_window = 5;  // Janela de recepção
+    char protocolo[10] = "GBN";  // Valor padrão
+
+    // Variáveis para opções
+    int opcao;
+
+    // Processa os argumentos de linha de comando
+    while ((opcao = getopt(argc, argv, "l:n:e:p:")) != -1) {
+        switch (opcao) {
+            case 'l':
+                ack_loss_packet = atoi(optarg);
+                break;
+            case 'n':
+                nack_packet = atoi(optarg);
+                break;
+            case 'e':
+                error_ack_packet = atoi(optarg);
+                break;
+            case 'p':
+                strcpy(protocolo, optarg);
+                break;
+            default:
+                fprintf(stderr, "Uso: %s [-l ack_loss_packet] [-n nack_packet] [-e error_ack_packet] [-p protocolo]\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
+
+    printf("Configurações do Servidor:\n");
+    printf("Não confirmar pacote de sequência: %d\n", ack_loss_packet);
+    printf("Enviar NACK para pacote de sequência: %d\n", nack_packet);
+    printf("Inserir erro de integridade no ACK para sequência: %d\n", error_ack_packet);
+    printf("Protocolo: %s\n", protocolo);
 
     // Cria um socket RAW
     sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -75,18 +107,6 @@ int main() {
     set_nonblocking(sock);
 
     printf("Servidor esperando pacotes...\n");
-
-    printf("Deseja não confirmar algum pacote? (Digite o número de sequência ou -1 para nenhum): ");
-    scanf("%d", &ack_loss_packet);
-    getchar();
-
-    printf("Deseja enviar NACK para algum pacote? (Digite o número de sequência ou -1 para nenhum): ");
-    scanf("%d", &nack_packet);
-    getchar();
-
-    printf("Deseja inserir erro de integridade em algum ACK? (Digite o número de sequência ou -1 para nenhum): ");
-    scanf("%d", &error_ack_packet);
-    getchar();
 
     // Loop de recebimento
     while (1) {
