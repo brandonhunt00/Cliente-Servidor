@@ -1,6 +1,60 @@
 import socket
-from protocolo_servidor import ProtocoloServidor
-from simulador_erros import introduzir_erro_ack, simular_perda_ack
+import random
+
+class ProtocoloServidor:
+    def __init__(self):
+        self.respostas = {
+            "ACK": "ACK",
+            "NAK": "NAK",
+            "ACK_BATCH": "ACK_BATCH"
+        }
+
+    def resposta_enviar(self, tipo, numero_sequencia=0, conteudo=""):
+        """
+        Retorna uma resposta formatada para envio ao cliente, incluindo número de sequência.
+        """
+        if tipo in self.respostas:
+            return f"{self.respostas[tipo]}:{numero_sequencia}:{conteudo}"
+        else:
+            raise ValueError("Tipo de resposta não suportado")
+
+    def resposta_receber(self, resposta):
+        """
+        Processa a resposta recebida do cliente e retorna o tipo, número de sequência e conteúdo.
+        """
+        partes = resposta.split(":")
+        tipo = partes[0]
+        numero_sequencia = int(partes[1])
+        conteudo = partes[2] if len(partes) > 2 else ""
+        return tipo, numero_sequencia, conteudo
+
+def introduzir_erro_ack(ack, probabilidade_erro=0.1):
+    """
+    Introduz um erro no conteúdo do ACK/NAK, preservando o tipo da mensagem e o número de sequência.
+    """
+    partes = ack.split(":")
+    if len(partes) >= 2:
+        # Preserva o tipo (ACK/NAK) e número de sequência
+        tipo = partes[0]
+        numero_sequencia = partes[1]
+
+        # Introduz erro no conteúdo, se houver
+        if len(partes) > 2:
+            conteudo = partes[2]
+            conteudo_com_erro = ''.join(random.choice('!@#$%?') if random.random() < probabilidade_erro else c for c in conteudo)
+            partes[2] = conteudo_com_erro
+        ack_com_erro = ":".join(partes)
+    else:
+        ack_com_erro = ack  # Retorna a mensagem sem alterações se o formato estiver incorreto
+    
+    return ack_com_erro
+
+def simular_perda_ack():
+    """
+    Retorna True para simular a perda de um ACK.
+    """
+    probabilidade_perda_ack = 0.1
+    return random.random() < probabilidade_perda_ack
 
 def iniciar_servidor():
     host = '127.0.0.1'
