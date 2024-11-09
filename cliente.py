@@ -1,8 +1,7 @@
 import socket
 import time
 import threading
-from protocolo_cliente import ProtocoloCliente
-from simulador_erros import introduzir_erro, simular_perda
+import random
 
 # Variável global para armazenar ACKs recebidos
 ack_received = [False] * 100  # Controle de ACKs recebidos para até 100 pacotes (exemplo)
@@ -11,6 +10,68 @@ ack_received = [False] * 100  # Controle de ACKs recebidos para até 100 pacotes
 pacotes_enviados = 0
 pacotes_retransmitidos = 0
 
+class ProtocoloCliente:
+    def __init__(self):
+        self.mensagens = {
+            "SEND": "SEND",
+            "SEND_BURST": "SEND_BURST",
+            "ERROR": "ERROR",
+            "END": "END"
+        }
+
+    def mensagem_enviar(self, tipo, conteudo="", numero_sequencia=0):
+        """
+        Retorna uma mensagem formatada para envio ao servidor, incluindo número de sequência.
+        """
+        if tipo in self.mensagens:
+            return f"{self.mensagens[tipo]}:{numero_sequencia}:{conteudo}"
+        else:
+            raise ValueError("Tipo de mensagem não suportado")
+
+    def mensagem_receber(self, mensagem):
+        """
+        Processa a mensagem recebida do servidor e retorna o tipo, número de sequência e conteúdo.
+        """
+        partes = mensagem.split(":")
+        tipo = partes[0]
+
+        # Verifica se o número de sequência é um valor numérico
+        try:
+            numero_sequencia = int(partes[1])
+        except ValueError:
+            print(f"Aviso: número de sequência inválido na mensagem recebida: {partes[1]}")
+            return tipo, None, partes[2] if len(partes) > 2 else ""
+
+        conteudo = partes[2] if len(partes) > 2 else ""
+        return tipo, numero_sequencia, conteudo
+
+def introduzir_erro(mensagem, probabilidade_erro=0.1):
+    """
+    Introduz um erro no conteúdo da mensagem, preservando o tipo e o número de sequência.
+    """
+    partes = mensagem.split(":")
+    if len(partes) >= 2:
+        tipo = partes[0]
+        numero_sequencia = partes[1]
+
+        # Introduz erro no conteúdo, se houver
+        if len(partes) > 2:
+            conteudo = partes[2]
+            conteudo_com_erro = ''.join(random.choice('!@#$%?') if random.random() < probabilidade_erro else c for c in conteudo)
+            partes[2] = conteudo_com_erro
+        mensagem_com_erro = ":".join(partes)
+    else:
+        mensagem_com_erro = mensagem  # Retorna a mensagem sem alterações se o formato estiver incorreto
+    
+    return mensagem_com_erro
+
+def simular_perda():
+    """
+    Retorna True para simular uma perda de pacote com uma certa probabilidade.
+    """
+    probabilidade_perda = 0.1
+    return random.random() < probabilidade_perda
+
 def iniciar_cliente():
     global cliente_socket, pacotes_enviados, pacotes_retransmitidos
 
@@ -18,24 +79,23 @@ def iniciar_cliente():
     porta = 12346  # Porta atualizada para evitar conflitos
 
     cliente_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    cliente_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Reutiliza o socket para evitar conflitos
+    cliente_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     protocolo = ProtocoloCliente()
 
     # Configurações da janela deslizante e temporizador
-    window_size = 3  # Quantidade de pacotes que podem ser enviados sem confirmação
-    timeout = 2  # Tempo limite para retransmissão em segundos
-    base = 0  # Primeiro número de sequência da janela
-    next_seq_num = 0  # Próximo número de sequência a ser enviado
+    window_size = 3
+    timeout = 2
+    base = 0
+    next_seq_num = 0
 
     # Função para lidar com a recepção de ACKs
     def receber_ack():
-        nonlocal base  # Permite modificar a variável base dentro da função
+        nonlocal base
         while True:
             try:
                 resposta = cliente_socket.recv(1024).decode()
                 tipo, seq, conteudo = protocolo.mensagem_receber(resposta)
 
-                # Ignora mensagens com número de sequência inválido
                 if seq is None:
                     print("Mensagem inválida recebida e ignorada.")
                     continue
@@ -43,23 +103,20 @@ def iniciar_cliente():
                 print(f"Resposta do servidor: Tipo={tipo}, Número de Sequência={seq}, Conteúdo={conteudo}")
 
                 if tipo == "ACK" and seq >= base:
-                    # Marca o ACK como recebido e desliza a janela
                     ack_received[seq] = True
-                    while ack_received[base]:  # Desliza a janela até o próximo pacote não confirmado
+                    while ack_received[base]:
                         base += 1
 
             except OSError:
-                break  # Sai do loop se o socket for fechado
+                break
 
     try:
         cliente_socket.connect((host, porta))
         print(f"Conectado ao servidor em {host}:{porta}")
 
-        # Inicia a thread para receber ACKs após a conexão estar estabelecida
         threading.Thread(target=receber_ack, daemon=True).start()
 
         while True:
-            # Envia pacotes enquanto houver espaço na janela
             while next_seq_num < base + window_size:
                 mensagem = protocolo.mensagem_enviar("SEND", f"Pacote {next_seq_num}", next_seq_num)
                 mensagem_com_erro = introduzir_erro(mensagem)
@@ -71,11 +128,10 @@ def iniciar_cliente():
                 else:
                     print(f"Pacote {next_seq_num} simulado como perdido.")
 
-                # Inicia o temporizador para o pacote
                 threading.Timer(timeout, lambda seq=next_seq_num: retransmitir_pacote(seq)).start()
 
                 next_seq_num += 1
-                time.sleep(0.5)  # Delay para simular intervalo entre envios
+                time.sleep(0.5)
 
     finally:
         cliente_socket.close()
@@ -85,12 +141,9 @@ def iniciar_cliente():
         print(f"Pacotes retransmitidos: {pacotes_retransmitidos}")
 
 def retransmitir_pacote(seq):
-    """
-    Retransmite o pacote caso o ACK não tenha sido recebido.
-    """
     global cliente_socket, pacotes_retransmitidos
     protocolo = ProtocoloCliente()
-    if not ack_received[seq]:  # Verifica se o ACK foi recebido
+    if not ack_received[seq]:
         mensagem = protocolo.mensagem_enviar("SEND", f"Pacote {seq}", seq)
         cliente_socket.send(mensagem.encode())
         pacotes_retransmitidos += 1
