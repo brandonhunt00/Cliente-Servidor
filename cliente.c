@@ -8,18 +8,19 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/select.h>
+#include <getopt.h>  // Inclusão para processar argumentos de linha de comando
 
 #define TAMANHO_BUFFER 4096
 #define TAMANHO_DADOS 512
 #define PORTA_DESTINO 8080
-#define TIMEOUT_SEC 2  // Timeout for retransmission
+#define TIMEOUT_SEC 2  // Timeout para retransmissão
 
 // Flags
 #define FLAG_ACK 0x1
 #define FLAG_NACK 0x2
 #define FLAG_SYN 0x4
 #define FLAG_FIN 0x8
-#define FLAG_ERR 0x10  // For error simulation
+#define FLAG_ERR 0x10  // Para simulação de erro
 
 // Estrutura do nosso "UDP" simulado com novos campos
 struct udp_simulado {
@@ -53,17 +54,17 @@ void set_nonblocking(int sock) {
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     struct sockaddr_in destino;
     int sock;
     char pacote[4096];
     struct iphdr *ip_header = (struct iphdr *)pacote;
     struct udp_simulado *udp_payload = (struct udp_simulado *)(pacote + sizeof(struct iphdr));
     socklen_t tamanho_destino;
-    int num_pacotes, i, erro_pacote;
+    int i, erro_pacote;
     uint32_t seq_num = 0;
-    uint16_t cwnd = 1;  // Congestion window
-    uint16_t ssthresh = 8;  // Slow start threshold
+    uint16_t cwnd = 1;  // Janela de congestionamento
+    uint16_t ssthresh = 8;  // Limiar para slow start
     char mensagem[TAMANHO_DADOS];
     fd_set read_fds;
     struct timeval timeout;
@@ -72,6 +73,40 @@ int main() {
     struct sockaddr_in origem;
     socklen_t tamanho_origem;
     int ack_expected = 0;
+    int num_pacotes = 1;
+    int window_size = 1;
+    char protocolo[10] = "GBN";  // Valor padrão
+
+    // Variáveis para opções
+    int opcao;
+    erro_pacote = 0;  // Inicializa com 0 (nenhum erro)
+
+    // Processa os argumentos de linha de comando
+    while ((opcao = getopt(argc, argv, "n:e:w:p:")) != -1) {
+        switch (opcao) {
+            case 'n':
+                num_pacotes = atoi(optarg);
+                break;
+            case 'e':
+                erro_pacote = atoi(optarg);
+                break;
+            case 'w':
+                window_size = atoi(optarg);
+                break;
+            case 'p':
+                strcpy(protocolo, optarg);
+                break;
+            default:
+                fprintf(stderr, "Uso: %s [-n num_pacotes] [-e erro_pacote] [-w window_size] [-p protocolo]\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
+
+    printf("Configurações do Cliente:\n");
+    printf("Número de pacotes: %d\n", num_pacotes);
+    printf("Erro de integridade no pacote: %d\n", erro_pacote);
+    printf("Tamanho da janela: %d\n", window_size);
+    printf("Protocolo: %s\n", protocolo);
 
     // Cria um socket RAW
     sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -94,14 +129,6 @@ int main() {
     destino.sin_family = AF_INET;
     destino.sin_port = htons(PORTA_DESTINO);
     destino.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-    printf("Digite o número de pacotes a enviar: ");
-    scanf("%d", &num_pacotes);
-    getchar();  // Limpa o buffer do stdin
-
-    printf("Deseja inserir um erro de integridade em algum pacote? (Digite o número do pacote ou 0 para nenhum): ");
-    scanf("%d", &erro_pacote);
-    getchar();  // Limpa o buffer do stdin
 
     for (i = 0; i < num_pacotes; i++) {
         memset(pacote, 0, sizeof(pacote));  // Limpa o pacote
@@ -188,6 +215,7 @@ int main() {
                             } else {
                                 cwnd += 1;  // Crescimento linear
                             }
+                            printf("Janela de congestionamento atualizada: %d\n", cwnd);
                         } else {
                             printf("ACK recebido para sequência inesperada %d\n", udp_resp->ack_num);
                         }
@@ -210,6 +238,7 @@ int main() {
             // Reduz a janela de congestionamento (Exemplo simples)
             ssthresh = cwnd / 2;
             cwnd = 1;
+            printf("Janela de congestionamento reduzida: %d\n", cwnd);
             seq_num = ack_expected;  // Reenvia o pacote com o mesmo número de sequência
             i--;  // Decrementa i para reenvio
         }
