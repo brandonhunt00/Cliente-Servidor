@@ -1,4 +1,4 @@
-# Aplicação Cliente-Servidor com Controle de Fluxo e Retransmissão
+# Aplicação Cliente-Servidor 
 ## Descrição
 Este projeto é uma aplicação cliente-servidor em Python que implementa um protocolo de comunicação confiável na camada de aplicação, considerando um canal com perdas e erros simulados. Ele utiliza um sistema de janela deslizante para controle de fluxo e congestionamento, além de temporizadores para garantir a retransmissão de pacotes perdidos.
 
