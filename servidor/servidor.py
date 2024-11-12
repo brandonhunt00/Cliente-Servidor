@@ -1,79 +1,129 @@
 import socket
-from protocoloServidor import ProtocoloServidor
-from simuladorErros import introduzir_erro_ack, simular_perda_ack
+import threading
+import random
 
-def iniciar_servidor():
-    host = '127.0.0.1'
-    porta = 12346
-    modo_retransmissao = "Selective Repeat"
-    confirmacao_em_grupo = True  # Ativa a confirmação em grupo
+class Servidor:
+    def __init__(self, host, port, protocolo, cumulativo):
+        self.host = host
+        self.port = port
+        self.protocolo = protocolo
+        self.cumulativo = cumulativo
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind((self.host, self.port))
+        self.socket.listen(5)
+        print(f"Servidor iniciado em {self.host}:{self.port}")
+        self.prob_erro_ack = 0.1
+        self.tamanho_janela_recepcao = 5
+        self.seq_esperado = 1
+        self.mensagens_recebidas = {}
+        self.pacotes_nao_confirmados = {}
 
-    servidor_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    servidor_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    def calcular_checksum(self, mensagem):
+        total = 0
+        for char in mensagem:
+            total += ord(char)
+            total = total ^ (total << 1) & 0xFFFF
+        return total & 0xFFFF
 
-    try:
-        servidor_socket.bind((host, porta))
-        servidor_socket.listen(5)
-        print(f"Servidor iniciado em {host}:{porta} no modo {modo_retransmissao}")
+    def enviar_ack(self, conn, seq_num):
+        ack_data = f"ACK:{seq_num}"
+        checksum = self.calcular_checksum(ack_data)
+        ack = f"{ack_data}:{checksum}\n"
+        if random.random() < self.prob_erro_ack:
+            ack_corrompido = f"{ack_data}CORROMPIDO\n"
+            conn.sendall(ack_corrompido.encode())
+            print(f"Enviado ACK corrompido para pacote {seq_num}")
+        else:
+            conn.sendall(ack.encode())
+            print(f"Enviado: {ack.strip()} (Checksum: {checksum})")
 
-        protocolo = ProtocoloServidor()
-        numero_sequencia_esperado = 0
-        janela_recebida = {}
+    def enviar_nak(self, conn, seq_num):
+        nak_data = f"NAK:{seq_num}"
+        checksum = self.calcular_checksum(nak_data)
+        nak = f"{nak_data}:{checksum}\n"
+        conn.sendall(nak.encode())
+        print(f"Enviado: {nak.strip()} (Checksum: {checksum})")
 
+    def receber_dados(self, conn):
+        buffer = ''
         while True:
-            cliente_socket, endereco = servidor_socket.accept()
-            print(f"Conexão estabelecida com {endereco}")
-
             try:
-                while True:
-                    dados = cliente_socket.recv(1024).decode()
-                    if not dados:
-                        break
-                    print(f"Recebido do cliente: {dados}")
+                data = conn.recv(1024).decode()
+                if not data:
+                    break
 
-                    tipo, seq, conteudo = protocolo.resposta_receber(dados)
+                buffer += data
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    partes = line.strip().split(":")
+                    if len(partes) >= 3:
+                        if partes[0] in ["SEND", "ERR"]:
+                            if len(partes) != 4:
+                                print(f"Dados recebidos em formato incorreto: {line.strip()}")
+                                continue
 
-                    if confirmacao_em_grupo:
-                        if seq == numero_sequencia_esperado:
-                            inicio = numero_sequencia_esperado
-                            numero_sequencia_esperado += 1
-                            while numero_sequencia_esperado in janela_recebida:
-                                janela_recebida.pop(numero_sequencia_esperado)
-                                numero_sequencia_esperado += 1
-                            fim = numero_sequencia_esperado - 1
-                            
-                            # Envia ACK em grupo apenas se houver mais de um pacote no intervalo
-                            if fim > inicio:
-                                resposta = protocolo.resposta_enviar("ACK", f"{inicio}-{fim}")
+                            comando, seq_num_str, conteudo, checksum_recebido_str = partes
+                            seq_num = int(seq_num_str)
+                            checksum_recebido = int(checksum_recebido_str)
+                            checksum_calculado = self.calcular_checksum(conteudo)
+
+                            print(f"Recebido {comando}:{seq_num}:{conteudo} (Checksum recebido: {checksum_recebido}, Checksum calculado: {checksum_calculado})")
+
+                            if checksum_recebido != checksum_calculado:
+                                print(f"Erro de checksum no pacote {seq_num}")
+                                self.enviar_nak(conn, seq_num)
+                            elif self.protocolo == 'sr' or seq_num == self.seq_esperado:
+                                self.mensagens_recebidas[seq_num] = conteudo
+                                self.enviar_ack(conn, seq_num)
+                                if seq_num == self.seq_esperado:
+                                    self.seq_esperado += 1
                             else:
-                                resposta = protocolo.resposta_enviar("ACK", f"{inicio}")
-                        else:
-                            resposta = protocolo.resposta_enviar("NAK", seq)
-                            print("Número de sequência fora da janela, enviando NAK.")
+                                self.enviar_nak(conn, self.seq_esperado)
+                        elif partes[0] in ["ACK_CONFIRM", "NAK_CONFIRM"]:
+                            if len(partes) != 3:
+                                print(f"Confirmação recebida em formato incorreto: {line.strip()}")
+                                continue
+
+                            tipo_confirmacao, seq_num_str = partes[0], partes[1]
+                            checksum_recebido = int(partes[2])
+                            checksum_calculado = self.calcular_checksum(f"{tipo_confirmacao}:{seq_num_str}")
+
+                            if checksum_recebido != checksum_calculado:
+                                print(f"Checksum incorreto na confirmação {tipo_confirmacao} para pacote {seq_num_str}")
+                            else:
+                                print(f"Recebida confirmação {tipo_confirmacao} para pacote {seq_num_str} (Checksum verificado)")
                     else:
-                        # Modo padrão de confirmação individual
-                        if seq == numero_sequencia_esperado:
-                            resposta = protocolo.resposta_enviar("ACK", seq)
-                            numero_sequencia_esperado += 1
-                        else:
-                            resposta = protocolo.resposta_enviar("NAK", seq)
-                            print("Número de sequência fora da janela, enviando NAK.")
+                        print(f"Mensagem recebida em formato desconhecido: {line.strip()}")
+            except Exception as e:
+                print(f"Erro na comunicação: {e}")
+                break
+        conn.close()
+        print("Conexão encerrada pelo cliente.")
 
-                    if simular_perda_ack():
-                        print("Simulando perda de ACK. Nenhuma confirmação enviada.")
-                        continue
+    def iniciar(self):
+        print("Aguardando conexões...")
+        try:
+            while True:
+                conn, addr = self.socket.accept()
+                print(f"Conexão com {addr} estabelecida.")
+                client_thread = threading.Thread(target=self.receber_dados, args=(conn,))
+                client_thread.daemon = True
+                client_thread.start()
+        except KeyboardInterrupt:
+            print("\nServidor interrompido pelo usuário.")
+        finally:
+            self.socket.close()
+            print("Socket do servidor fechado.")
 
-                    resposta_com_erro = introduzir_erro_ack(resposta)
-                    cliente_socket.send(resposta_com_erro.encode())
-                    print(f"Enviado para o cliente: {resposta_com_erro}")
-
-            finally:
-                cliente_socket.close()
-                print(f"Conexão com {endereco} encerrada")
-
-    finally:
-        servidor_socket.close()
-        print("Socket do servidor fechado")
+def menu_servidor():
+    host = "127.0.0.1"
+    port = int(input("Digite a porta do servidor (12346 por padrão): ") or 12346)
+    protocolo = input("Escolha o protocolo (SR para Selective Repeat, GBN para Go-Back-N): ").lower()
+    cumulativo = input("Deseja confirmar pacotes cumulativamente? (S/N): ").lower() == "s"
+    
+    servidor = Servidor(host, port, protocolo, cumulativo)
+    servidor.iniciar()
 
 if __name__ == "__main__":
-    iniciar_servidor()
+    menu_servidor()
