@@ -14,30 +14,11 @@ Temporizador de Retransmissão: Garante a retransmissão automática de pacotes 
 Modos de Operação: Suporte aos modos Go-Back-N e Selective Repeat.
 Simulação de Erros: Insere erros em pacotes e confirmações para simular falhas no canal de comunicação.
 
-## Estrutura do Projeto:
-
-projeto_cliente_servidor/
-├── cliente/
-│   ├── cliente.py
-│   ├── protocoloCliente.py
-│   ├── simulador_erros.py
-│   └── utils.py
-├── servidor/
-│   ├── servidor.py
-│   ├── protocoloServidor.py
-│   ├── simulador_erros.py
-│   └── utils.py
-├── ambos/
-│   ├── utils.py
-│   ├── simuladorErros.py
-└── README.md
-
 ## Requisitos
 Python 3.8 ou superior
 Bibliotecas padrão do Python
 
 ## Como Executar o Projeto
-
 Passo 1: Clonar o Repositório
 git clone https://github.com/username/repo.git
 cd repo
