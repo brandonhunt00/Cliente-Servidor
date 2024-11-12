@@ -20,7 +20,7 @@ Bibliotecas padrão do Python
 
 ## Como Executar o Projeto
 Passo 1: Clonar o Repositório
-git clone https://github.com/username/repo.git
+git clone https://github.com/brandonhunt00/Cliente-Servidor
 cd repo
 
 Passo 2: Executar o Servidor
