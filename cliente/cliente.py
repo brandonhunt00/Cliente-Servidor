@@ -1,99 +1,189 @@
 import socket
-import time
 import threading
-from protocoloCliente import ProtocoloCliente
-from simuladorErros import introduzir_erro, simular_perda
+import random
+import sys
+import os
+import time
 
-# Variável global para armazenar ACKs recebidos
-ack_received = [False] * 100  # Controle de ACKs recebidos para até 100 pacotes (exemplo)
+class Cliente:
+    def __init__(self, host, port, protocolo, modo_envio, probabilidade_erro, tamanho_janela, num_mensagens):
+        self.host = host
+        self.port = port
+        self.protocolo = protocolo
+        self.modo_envio = modo_envio
+        self.prob_erro = probabilidade_erro
+        self.tamanho_janela_inicial = tamanho_janela
+        self.tamanho_janela = tamanho_janela
+        self.num_mensagens = num_mensagens
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.connect((self.host, self.port))
+        self.timeout = 2
+        self.lock = threading.Lock()
+        self.dados = []
+        self.acks = set()
+        self.seq_enviados = set()
+        self.inicio_janela = 1
+        self.fim_janela = self.inicio_janela + self.tamanho_janela - 1
+        self.carregar_dados()
+        self.cwnd = 1
+        self.ssthresh = 8
+        self.duplicated_acks = 0
 
-# Variáveis para o relatório de status
-pacotes_enviados = 0
-pacotes_retransmitidos = 0
+    def carregar_dados(self):
+        try:
+            path = os.path.join(sys.path[0], "carros.txt")
+            with open(path, "r") as file:
+                self.dados = [carro.strip() for carro in file.read().split(",")]
+        except FileNotFoundError:
+            print("Arquivo carros.txt não encontrado. Usando dados de exemplo.")
+            self.dados = [f"Carro{i+1}" for i in range(self.num_mensagens)]
+        self.dados = self.dados[:self.num_mensagens]
 
-def iniciar_cliente():
-    global cliente_socket, pacotes_enviados, pacotes_retransmitidos
+    def calcular_checksum(self, mensagem):
+        total = 0
+        for char in mensagem:
+            total += ord(char)
+            total = total ^ (total << 1) & 0xFFFF
+        return total & 0xFFFF
 
-    host = '127.0.0.1'
-    porta = 12346  # Porta atualizada para evitar conflitos
+    def enviar_pacote(self, pacote, seq_num):
+        checksum = self.calcular_checksum(pacote)
+        if random.random() < self.prob_erro:
+            pacote = f"ERR:{seq_num}:{pacote[::-1]}:{checksum}\n"
+            print(f"Simulando falha no pacote {seq_num}")
+        else:
+            pacote = f"SEND:{seq_num}:{pacote}:{checksum}\n"
+        if random.random() < self.prob_erro:
+            print(f"Simulando perda do pacote {seq_num}")
+            return
+        try:
+            self.socket.sendall(pacote.encode())
+            print(f"Enviado: {pacote.strip()} (Checksum: {checksum})")
+        except Exception as e:
+            print(f"Erro ao enviar pacote {seq_num}: {e}")
 
-    cliente_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    protocolo = ProtocoloCliente()
+    def enviar_confirmacao(self, tipo, seq_num):
+        confirmacao = f"{tipo}_CONFIRM:{seq_num}"
+        checksum = self.calcular_checksum(confirmacao)
+        mensagem = f"{confirmacao}:{checksum}\n"
+        if random.random() < self.prob_erro:
+            mensagem = f"{confirmacao}CORROMPIDO\n"
+            print(f"Enviando {tipo}_CONFIRM corrompido para pacote {seq_num}")
 
-    # Configurações da janela deslizante e temporizador
-    window_size = 3  # Quantidade de pacotes que podem ser enviados sem confirmação
-    timeout = 2  # Tempo limite para retransmissão em segundos
-    base = 0  # Primeiro número de sequência da janela
-    next_seq_num = 0  # Próximo número de sequência a ser enviado
+        try:
+            self.socket.sendall(mensagem.encode())
+            print(f"Enviado {tipo}_CONFIRM para pacote {seq_num} (Checksum: {checksum})")
+        except Exception as e:
+            print(f"Erro ao enviar confirmação para pacote {seq_num}: {e}")
 
-    # Função para lidar com a recepção de ACKs
-    def receber_ack():
-        nonlocal base  # Permite modificar a variável base dentro da função
-        while True:
+    def iniciar_temporizador(self, seq_num, pacote):
+        timer_thread = threading.Thread(target=self.temporizador, args=(seq_num, pacote))
+        timer_thread.daemon = True
+        timer_thread.start()
+
+    def temporizador(self, seq_num, pacote):
+        time.sleep(self.timeout)
+        with self.lock:
+            if seq_num not in self.acks:
+                print(f"Timeout para pacote {seq_num}, retransmitindo...")
+                self.enviar_pacote(pacote, seq_num)
+                self.iniciar_temporizador(seq_num, pacote)
+                self.ssthresh = max(self.cwnd // 2, 1)
+                self.cwnd = 1
+                self.duplicated_acks = 0
+
+    def receber_acks(self):
+        buffer = ''
+        total_mensagens = len(self.dados)
+        while len(self.acks) < total_mensagens:
             try:
-                resposta = cliente_socket.recv(1024).decode()
-                tipo, seq, conteudo = protocolo.mensagem_receber(resposta)
+                data = self.socket.recv(1024).decode()
+                if not data:
+                    break
+                buffer += data
+                while '\n' in buffer:
+                    resposta, buffer = buffer.split('\n', 1)
+                    resposta = resposta.strip()
+                    partes = resposta.split(":")
+                    if len(partes) != 3:
+                        print(f"Resposta inválida: {resposta}")
+                        continue
+                    tipo, seq_num_str, checksum_str = partes
+                    try:
+                        seq_num = int(seq_num_str)
+                        checksum_recebido = int(checksum_str)
+                        checksum_calculado = self.calcular_checksum(f"{tipo}:{seq_num}")
+                    except ValueError:
+                        print(f"ACK/NAK corrompido recebido: {resposta}")
+                        continue
+                    if checksum_recebido != checksum_calculado:
+                        print(f"Checksum incorreto para {tipo}:{seq_num}")
+                        continue
+                    with self.lock:
+                        if tipo == "ACK":
+                            if seq_num in self.acks:
+                                self.duplicated_acks += 1
+                                print(f"ACK duplicado recebido para pacote {seq_num}")
+                                if self.duplicated_acks == 3:
+                                    print("Recebidos 3 ACKs duplicados, iniciando Fast Retransmit")
+                                    self.ssthresh = max(self.cwnd // 2, 1)
+                                    self.cwnd = self.ssthresh + 3
+                            else:
+                                self.acks.add(seq_num)
+                                print(f"Recebido ACK para pacote {seq_num}")
+                                self.duplicated_acks = 0
+                                if self.cwnd < self.ssthresh:
+                                    self.cwnd += 1
+                                else:
+                                    self.cwnd += 1 / self.cwnd
+                                self.inicio_janela = max(self.acks) + 1 if self.acks else 1
+                                self.fim_janela = self.inicio_janela + int(self.cwnd) - 1
+                            self.enviar_confirmacao("ACK", seq_num)
+                        elif tipo == "NAK":
+                            print(f"Recebido NAK para pacote {seq_num}, retransmitindo...")
+                            self.enviar_pacote(self.dados[seq_num - 1], seq_num)
+                            self.iniciar_temporizador(seq_num, self.dados[seq_num - 1])
+                            self.enviar_confirmacao("NAK", seq_num)
+            except Exception as e:
+                print(f"Erro ao receber ACK/NAK: {e}")
+                break
+        print("Recebimento de ACKs finalizado.")
 
-                # Ignora mensagens com número de sequência inválido
-                if seq is None:
-                    print("Mensagem inválida recebida e ignorada.")
-                    continue
+    def enviar_dados(self):
+        threading.Thread(target=self.receber_acks, daemon=True).start()
+        total_mensagens = len(self.dados)
+        while self.inicio_janela <= total_mensagens:
+            with self.lock:
+                for seq_num in range(self.inicio_janela, min(self.fim_janela + 1, total_mensagens + 1)):
+                    if seq_num not in self.seq_enviados:
+                        pacote = self.dados[seq_num - 1]
+                        self.enviar_pacote(pacote, seq_num)
+                        self.seq_enviados.add(seq_num)
+                        self.iniciar_temporizador(seq_num, pacote)
+            time.sleep(0.1)
+        print("Envio de dados finalizado.")
 
-                print(f"Resposta do servidor: Tipo={tipo}, Número de Sequência={seq}, Conteúdo={conteudo}")
+    def iniciar(self):
+        self.enviar_dados()
+        while threading.active_count() > 1:
+            time.sleep(0.1)
+        self.fechar_conexao()
 
-                if tipo == "ACK" and seq >= base:
-                    # Marca o ACK como recebido e desliza a janela
-                    ack_received[seq] = True
-                    while ack_received[base]:  # Desliza a janela até o próximo pacote não confirmado
-                        base += 1
+    def fechar_conexao(self):
+        self.socket.close()
+        print("Conexão encerrada com o servidor.")
 
-            except OSError:
-                break  # Sai do loop se o socket for fechado
-
-    try:
-        cliente_socket.connect((host, porta))
-        print(f"Conectado ao servidor em {host}:{porta}")
-
-        # Inicia a thread para receber ACKs após a conexão estar estabelecida
-        threading.Thread(target=receber_ack, daemon=True).start()
-
-        while True:
-            # Envia pacotes enquanto houver espaço na janela
-            while next_seq_num < base + window_size:
-                mensagem = protocolo.mensagem_enviar("SEND", f"Pacote {next_seq_num}", next_seq_num)
-                mensagem_com_erro = introduzir_erro(mensagem)
-
-                if not simular_perda():
-                    cliente_socket.send(mensagem_com_erro.encode())
-                    pacotes_enviados += 1
-                    print(f"Enviado para o servidor: {mensagem_com_erro}")
-                else:
-                    print(f"Pacote {next_seq_num} simulado como perdido.")
-
-                # Inicia o temporizador para o pacote
-                threading.Timer(timeout, lambda seq=next_seq_num: retransmitir_pacote(seq)).start()
-
-                next_seq_num += 1
-                time.sleep(0.5)  # Delay para simular intervalo entre envios
-
-    finally:
-        cliente_socket.close()
-        print("Conexão encerrada")
-        print(f"Relatório de Status:")
-        print(f"Pacotes enviados: {pacotes_enviados}")
-        print(f"Pacotes retransmitidos: {pacotes_retransmitidos}")
-
-def retransmitir_pacote(seq):
-    """
-    Retransmite o pacote caso o ACK não tenha sido recebido.
-    """
-    global cliente_socket, pacotes_retransmitidos
-    protocolo = ProtocoloCliente()
-    if not ack_received[seq]:  # Verifica se o ACK foi recebido
-        mensagem = protocolo.mensagem_enviar("SEND", f"Pacote {seq}", seq)
-        cliente_socket.send(mensagem.encode())
-        pacotes_retransmitidos += 1
-        print(f"Retransmitindo pacote {seq} devido ao timeout.")
+def menu_cliente():
+    host = input("Digite o endereço do servidor (127.0.0.1 por padrão): ") or "127.0.0.1"
+    port = int(input("Digite a porta do servidor (12346 por padrão): ") or 12346)
+    protocolo = input("Escolha o protocolo (SR para Selective Repeat, GBN para Go-Back-N): ").lower()
+    modo_envio = input("Escolha o modo de envio (unico ou rajada): ").lower()
+    probabilidade_erro = float(input("Digite a probabilidade de erro para gerar NAKs (ex: 0.1): "))
+    tamanho_janela = int(input("Digite o tamanho inicial da janela de envio: "))
+    num_mensagens = int(input("Digite o número total de mensagens a serem enviadas: "))
+    
+    cliente = Cliente(host, port, protocolo, modo_envio, probabilidade_erro, tamanho_janela, num_mensagens)
+    cliente.iniciar()
 
 if __name__ == "__main__":
-    iniciar_cliente()
+    menu_cliente()
