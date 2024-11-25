@@ -4,26 +4,94 @@ import time
 import random
 import os
 
-class Cliente:
+class ImplementacaoCliente:
     def __init__(self, host, port, probabilidadeErro, janela, numeroMensagens, protocolo):
         self.host = host
         self.port = port
-        self.probabilidadeErro = probabilidadeErro 
-        self.janela = janela 
-        self.numeroMensagens = numeroMensagens 
-        self.protocolo = protocolo.upper() 
+        self.probabilidadeErro = probabilidadeErro
+        self.janela = janela
+        self.numeroMensagens = numeroMensagens
+        self.protocolo = protocolo.upper()
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.connect((self.host, self.port))
-        self.acks_recebidos = set()
-        self.dados_enviados = {}
-        self.timeout = 2 
-        self.timer_threads = {}
-        self.buffer_dados = []
+        self.acksRecebidos = set()
+        self.dadosEnviados = {}
+        self.timeout = 2
+        self.threadTimer = {}
+        self.dadosDeBuffer = []
+        self.tamanhoBuffer = 1024
 
-    def enviar_handshake(self):
-        handshake_msg = f"HANDSHAKE:PROTOCOL:{self.protocolo}:WINDOW:{self.janela}"
-        self.socket.sendall(f"{handshake_msg}\n".encode())
-        print(f"Handshake enviado: {handshake_msg}")
+    def recebimentoDeRespostas(self):
+        buffer = ""
+        while len(self.acksRecebidos) < self.numeroMensagens:
+            try:
+                data = self.socket.recv(1024).decode()
+                if not data:
+                    break
+                buffer += data
+                while "\n" in buffer:
+                    linha, buffer = buffer.split("\n", 1)
+                    partes = linha.split(":")
+                    if len(partes) < 3:
+                        continue
+                    tipo, sequenciaStr, strChecksum = partes
+                    sequenciaDeNumeros = int(sequenciaStr)
+                    checksum = int(strChecksum)
+
+                    esperado = f"{tipo}:{sequenciaDeNumeros}"
+                    if self.calculoChecksum(esperado) == checksum:
+                        if tipo == "ACK":
+                            print(f"Recebido ACK para pacote {sequenciaDeNumeros}")
+                            self.acksRecebidos.add(sequenciaDeNumeros)
+                            self.cancelar_timer(sequenciaDeNumeros)
+                        elif tipo == "NAK":
+                            print(f"NAK recebido para o pacote {sequenciaDeNumeros}, retransmitindo...")
+                            if sequenciaDeNumeros not in self.acksRecebidos:
+                                self.enviar_pacote(sequenciaDeNumeros, self.dadosDeBuffer[sequenciaDeNumeros - 1])
+                                self.iniciar_timer(sequenciaDeNumeros)
+                    else:
+                        print(f"Resposta corrompida: {linha}")
+            except Exception as e:
+                print(f"Erro ao receber resposta: {e}")
+
+    def iniciar_envio(self, modoDeEnvio="unico"):
+        self.carregar_dados()
+        threading.Thread(target=self.recebimentoDeRespostas, daemon=True).start()
+
+        if modoDeEnvio == "unico":
+            for sequenciaDeNumeros in range(1, self.numeroMensagens + 1):
+                if sequenciaDeNumeros not in self.acksRecebidos:
+                    self.enviar_pacote(sequenciaDeNumeros, self.dadosDeBuffer[sequenciaDeNumeros - 1])
+                    self.iniciar_timer(sequenciaDeNumeros)
+        elif modoDeEnvio == "rajada":
+            pacotes_para_enviar = []
+            for sequenciaDeNumeros in range(1, self.numeroMensagens + 1):
+                if sequenciaDeNumeros not in self.acksRecebidos:
+                    mensagem = self.dadosDeBuffer[sequenciaDeNumeros - 1]
+                    checksum = self.calculoChecksum(mensagem)
+                    pacote = f"SEND:{sequenciaDeNumeros}:{mensagem}:{checksum}"
+                    pacotes_para_enviar.append(pacote)
+
+            modoRajada = ";".join(pacotes_para_enviar) + "\n"
+            try:
+                self.socket.sendall(modoRajada.encode())
+                print(f"Enviado em rajada: {modoRajada.strip()}")
+            except Exception as e:
+                print(f"Erro ao enviar pacotes em rajada: {e}")
+
+        while len(self.acksRecebidos) < self.numeroMensagens:
+            time.sleep(1)
+
+        print("Todos os pacotes foram confirmados. Encerrando...")
+
+    def fechar_conexao(self):
+        self.socket.close()
+        print("Conexão fechada.")
+
+    def handshake(self):
+        mensagemHandshake = f"HANDSHAKE:PROTOCOL:{self.protocolo}:WINDOW:{self.janela}"
+        self.socket.sendall(f"{mensagemHandshake}\n".encode())
+        print(f"Handshake enviado: {mensagemHandshake}")
         ack_handshake = self.socket.recv(1024).decode().strip()
 
         if ack_handshake.startswith(f"ACK_HANDSHAKE:PROTOCOL:{self.protocolo}:WINDOW:{self.janela}"):
@@ -37,131 +105,70 @@ class Cliente:
         path = os.path.join(os.path.dirname(__file__), "mensagens.txt")
         try:
             with open(path, "r") as arquivo:
-                self.buffer_dados = [linha.strip() for linha in arquivo.read().split(",")]
+                self.dadosDeBuffer = [
+                    linha.strip()[:self.tamanhoBuffer]
+                    for linha in arquivo.read().split(",")
+                ]
+                print(f"Mensagens carregadas (limitadas a {self.tamanhoBuffer} bytes cada).")
         except FileNotFoundError:
             print("Arquivo mensagens.txt não encontrado. Usando mensagens genéricas.")
-            self.buffer_dados = [f"Mensagem {i + 1}" for i in range(self.numeroMensagens)]
+            self.dadosDeBuffer = [
+                f"Mensagem {i + 1}"[:self.tamanhoBuffer]
+                for i in range(self.numeroMensagens)
+            ]
 
-    def calcular_checksum(self, mensagem):
+    def calculoChecksum(self, mensagem):
         return sum(ord(c) for c in mensagem) & 0xFFFF
 
-    def enviar_pacote(self, seq_num, mensagem):
-        checksum = self.calcular_checksum(mensagem)
+    def enviar_pacote(self, sequenciaDeNumeros, mensagem):
+        checksum = self.calculoChecksum(mensagem)
         if random.random() < self.probabilidadeErro:
-            mensagem = f"ERR:{seq_num}:{mensagem[::-1]}:{checksum}"
-            print(f"Simulando falha no pacote {seq_num}")
+            mensagem = f"ERR:{sequenciaDeNumeros}:{mensagem[::-1]}:{checksum}"
+            print(f"Simulando falha no pacote {sequenciaDeNumeros}")
         else:
-            mensagem = f"SEND:{seq_num}:{mensagem}:{checksum}"
+            mensagem = f"SEND:{sequenciaDeNumeros}:{mensagem}:{checksum}"
         try:
             self.socket.sendall(f"{mensagem}\n".encode())
-            self.dados_enviados[seq_num] = mensagem
+            self.dadosEnviados[sequenciaDeNumeros] = mensagem
             print(f"Enviado: {mensagem}")
         except Exception as e:
-            print(f"Erro ao enviar pacote {seq_num}: {e}")
+            print(f"Erro ao enviar pacote {sequenciaDeNumeros}: {e}")
 
-    def iniciar_timer(self, seq_num):
+    def iniciar_timer(self, sequenciaDeNumeros):
         def timer_expirado():
-            if seq_num not in self.acks_recebidos:
-                print(f"Timeout para pacote {seq_num}, retransmitindo...")
-                self.enviar_pacote(seq_num, self.buffer_dados[seq_num - 1])
-                self.iniciar_timer(seq_num)
+            if sequenciaDeNumeros not in self.acksRecebidos:
+                print(f"Timeout para pacote {sequenciaDeNumeros}, retransmitindo...")
+                self.enviar_pacote(sequenciaDeNumeros, self.dadosDeBuffer[sequenciaDeNumeros - 1])
+                self.iniciar_timer(sequenciaDeNumeros)
 
-        if seq_num in self.timer_threads:
-            self.timer_threads[seq_num].cancel()
+        if sequenciaDeNumeros in self.threadTimer:
+            self.threadTimer[sequenciaDeNumeros].cancel()
 
         timer = threading.Timer(self.timeout, timer_expirado)
         timer.start()
-        self.timer_threads[seq_num] = timer
+        self.threadTimer[sequenciaDeNumeros] = timer
 
-    def cancelar_timer(self, seq_num):
-        if seq_num in self.timer_threads:
-            self.timer_threads[seq_num].cancel()
-            del self.timer_threads[seq_num]
+    def cancelar_timer(self, sequenciaDeNumeros):
+        if sequenciaDeNumeros in self.threadTimer:
+            self.threadTimer[sequenciaDeNumeros].cancel()
+            del self.threadTimer[sequenciaDeNumeros]
 
-    def receber_respostas(self):
-        buffer = ""
-        while len(self.acks_recebidos) < self.numeroMensagens:
-            try:
-                data = self.socket.recv(1024).decode()
-                if not data:
-                    break
-                buffer += data
-                while "\n" in buffer:
-                    linha, buffer = buffer.split("\n", 1)
-                    partes = linha.split(":")
-                    if len(partes) < 3:
-                        continue
-                    tipo, seq_num_str, checksum_str = partes
-                    seq_num = int(seq_num_str)
-                    checksum = int(checksum_str)
-
-                    esperado = f"{tipo}:{seq_num}"
-                    if self.calcular_checksum(esperado) == checksum:
-                        if tipo == "ACK":
-                            print(f"Recebido ACK para pacote {seq_num}")
-                            self.acks_recebidos.add(seq_num)
-                            self.cancelar_timer(seq_num)
-                        elif tipo == "NAK":
-                            print(f"Recebido NAK para pacote {seq_num}, retransmitindo...")
-                            if seq_num not in self.acks_recebidos:
-                                self.enviar_pacote(seq_num, self.buffer_dados[seq_num - 1])
-                                self.iniciar_timer(seq_num)
-                    else:
-                        print(f"Resposta corrompida: {linha}")
-            except Exception as e:
-                print(f"Erro ao receber resposta: {e}")
-
-    def iniciar_envio(self, modo_envio="unico"):
-        self.carregar_dados()
-        threading.Thread(target=self.receber_respostas, daemon=True).start()
-
-        if modo_envio == "unico":
-            for seq_num in range(1, self.numeroMensagens + 1):
-                if seq_num not in self.acks_recebidos:
-                    self.enviar_pacote(seq_num, self.buffer_dados[seq_num - 1])
-                    self.iniciar_timer(seq_num)
-        elif modo_envio == "rajada":
-            pacotes_para_enviar = []
-            for seq_num in range(1, self.numeroMensagens + 1):
-                if seq_num not in self.acks_recebidos:
-                    mensagem = self.buffer_dados[seq_num - 1]
-                    checksum = self.calcular_checksum(mensagem)
-                    pacote = f"SEND:{seq_num}:{mensagem}:{checksum}"
-                    pacotes_para_enviar.append(pacote)
-
-            mensagem_em_rajada = ";".join(pacotes_para_enviar) + "\n"
-            try:
-                self.socket.sendall(mensagem_em_rajada.encode())
-                print(f"Enviado em rajada: {mensagem_em_rajada.strip()}")
-            except Exception as e:
-                print(f"Erro ao enviar pacotes em rajada: {e}")
-
-        while len(self.acks_recebidos) < self.numeroMensagens:
-            time.sleep(1)
-
-        print("Todos os pacotes foram confirmados. Encerrando...")
-
-    def fechar_conexao(self):
-        self.socket.close()
-        print("Conexão fechada.")
-
-def menu_cliente():
+def menuDeImplementacaoCliente():
     host = input("Digite o endereço do servidor (127.0.0.1): ") or "127.0.0.1"
-    port = int(input("Digite a porta do servidor (123): ") or 123)
+    port = int(input("Digite a porta do servidor: ") or 123)
     probabilidadeErro = float(input("Digite a probabilidade de erro: "))
     janela = int(input("Digite o tamanho inicial da janela: "))
     numeroMensagens = int(input("Digite o número de mensagens a enviar: "))
-    protocolo = input("Escolha o protocolo (SR para Selective Repeat ou GBN para Go-Back-N): ").upper()
-    modo_envio = input("Escolha o modo de envio (unico/rajada): ").lower()
+    protocolo = input("Escolha o protocolo (SR ou GBN): ").upper()
+    modoDeEnvio = input("Escolha o modo de envio (unico/rajada): ").lower()
 
-    cliente = Cliente(host, port, probabilidadeErro, janela, numeroMensagens, protocolo)
-    cliente.enviar_handshake()
-    if modo_envio == "unico":
+    cliente = ImplementacaoCliente(host, port, probabilidadeErro, janela, numeroMensagens, protocolo)
+    cliente.handshake()
+    if modoDeEnvio == "unico":
         cliente.iniciar_envio()
-    elif modo_envio == "rajada":
+    elif modoDeEnvio == "rajada":
         cliente.iniciar_envio()
     cliente.fechar_conexao()
 
-
 if __name__ == "__main__":
-    menu_cliente()
+    menuDeImplementacaoCliente()
